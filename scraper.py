@@ -4,10 +4,17 @@ Uses Playwright (headless Chromium) to execute JavaScript and extract
 the current_popularity data that Google loads dynamically.
 """
 
+import os
 import re
 import logging
 from typing import Optional
 from datetime import datetime
+
+# Ensure Playwright finds its browsers in the same place at build and runtime
+os.environ.setdefault(
+    "PLAYWRIGHT_BROWSERS_PATH",
+    "/opt/render/project/src/.browsers"
+)
 
 import config
 
