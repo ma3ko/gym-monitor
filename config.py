@@ -22,8 +22,8 @@ def _require(key: str) -> str:
 BOT_TOKEN: str = _require("BOT_TOKEN")
 CHAT_ID: str = _require("CHAT_ID")
 
-# ── Gym ───────────────────────────────────────────────
-PLACE_ID: str = _require("PLACE_ID")
+# ── BestTime API ──────────────────────────────────────
+BESTTIME_API_KEY: str = _require("BESTTIME_API_KEY")
 
 # ── Thresholds ────────────────────────────────────────
 QUIET_THRESHOLD: int = int(os.getenv("QUIET_THRESHOLD", "35"))

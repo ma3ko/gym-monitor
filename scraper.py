@@ -1,293 +1,182 @@
 """
-scraper.py — Fetches live busyness for a Google Maps place.
+scraper.py — Fetches foot traffic data via the BestTime.app API.
 
-Approach:
-  1. Try Google Search (less bot-protected than Maps)
-  2. Fall back to Google Maps with Playwright stealth
-  3. Multiple extraction patterns for maximum reliability
+Uses the forecast + live endpoints to get both historical popular
+times and real-time busyness data without any browser scraping.
+
+BestTime.app provides foot traffic data for 150+ countries using
+aggregated anonymous phone signals. No Google scraping needed.
 """
 
-import os
-import re
 import logging
 from typing import Optional
 from datetime import datetime
 
-os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/project/src/.browsers")
+import requests
 
 import config
 
 logger = logging.getLogger(__name__)
 
-# ── Approach 1: Google Search (preferred — less bot-protected) ──────────────
+BASE_URL = "https://besttime.app/api/v1"
 
-SEARCH_URL = "https://www.google.com/search?q={query}&hl=en&gl=us"
+VENUE_NAME = "24 Hour Fitness"
+VENUE_ADDRESS = "1680 Kapiolani Blvd, Honolulu, HI 96814"
 
 
-def _search_busyness() -> Optional[int]:
-    """
-    Scrape the Google Search Knowledge Panel for live busyness.
-    Google Search is far less aggressive about blocking bots than Maps.
-    """
+def _get_api_key() -> str:
+    """Get the BestTime private API key from config."""
+    return config.BESTTIME_API_KEY
+
+
+def _get_venue_id() -> Optional[str]:
+    """Get the cached venue_id, or create a forecast to obtain one."""
+    venue_id = getattr(config, "BESTTIME_VENUE_ID", None)
+    if venue_id:
+        return venue_id
+
+    # Create a new forecast to get the venue_id
+    logger.info("No venue_id cached — creating initial BestTime forecast...")
     try:
-        from playwright.sync_api import sync_playwright
+        resp = requests.post(
+            f"{BASE_URL}/forecasts",
+            params={
+                "api_key_private": _get_api_key(),
+                "venue_name": VENUE_NAME,
+                "venue_address": VENUE_ADDRESS,
+            },
+            timeout=30,
+        )
+        data = resp.json()
 
-        # Build a search query that will trigger the Knowledge Panel
-        query = "24+Hour+Fitness+Kapiolani+Honolulu+popular+times"
-        url = SEARCH_URL.format(query=query)
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-blink-features=AutomationControlled",
-                    "--single-process",
-                ],
-            )
-            ctx = browser.new_context(
-                viewport={"width": 1280, "height": 900},
-                locale="en-US",
-                timezone_id="Pacific/Honolulu",
-                user_agent=(
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                ),
-            )
-            ctx.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                window.chrome = { runtime: {} };
-            """)
-
-            page = ctx.new_page()
-            logger.info(f"Search approach: loading {url}")
-            page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-            page.wait_for_timeout(3_000)
-
-            # Try to click "Accept all" on Google consent
-            try:
-                accept_btn = page.locator('button:has-text("Accept all")')
-                if accept_btn.count() > 0:
-                    accept_btn.first.click()
-                    page.wait_for_timeout(2_000)
-                    logger.info("Clicked Google consent 'Accept all' button")
-            except Exception:
-                pass
-
-            # Extract busyness from the Knowledge Panel
-            # Method 1: aria-label with "% busy"
-            val = page.evaluate("""() => {
-                const els = document.querySelectorAll('[aria-label]');
-                for (const el of els) {
-                    const label = el.getAttribute('aria-label') || '';
-                    const m = label.match(/(\\d+)\\s*%\\s*busy/i);
-                    if (m) return parseInt(m[1]);
-                }
-                return null;
-            }""")
-
-            if val is not None:
-                browser.close()
-                return val
-
-            # Method 2: Text content with "% busy"
-            val = page.evaluate("""() => {
-                const text = document.body.innerText;
-                const m = text.match(/(\\d+)%\\s*busy/i);
-                return m ? parseInt(m[1]) : null;
-            }""")
-
-            if val is not None:
-                browser.close()
-                return val
-
-            # Method 3: Regex on raw HTML
-            html = page.content()
-            title = page.title()
-            logger.info(f"Search page title: {title}")
-            logger.info(f"Search HTML length: {len(html)} chars")
-            # Log a useful snippet for debugging
-            logger.info(f"Search HTML snippet: {html[:1500]}")
-
-            browser.close()
-
-            for pattern in [
-                r'"current_popularity"\s*:\s*(\d+)',
-                r'(\d+)%\s*busy',
-                r'aria-label="[^"]*?(\d+)%[^"]*busy',
-            ]:
-                m = re.search(pattern, html, re.IGNORECASE)
-                if m:
-                    return int(m.group(1))
-
+        if data.get("status") == "OK":
+            vid = data["venue_info"]["venue_id"]
+            logger.info(f"BestTime venue_id: {vid}")
+            logger.info(f"Venue: {data['venue_info'].get('venue_name')}")
+            logger.info(f"Address: {data['venue_info'].get('venue_address')}")
+            # Cache it on the config module for subsequent calls
+            config.BESTTIME_VENUE_ID = vid
+            return vid
+        else:
+            logger.error(f"BestTime forecast failed: {data}")
             return None
-
     except Exception as e:
-        logger.error(f"Search approach failed: {e}")
+        logger.error(f"BestTime forecast request failed: {e}")
         return None
 
-
-# ── Approach 2: Google Maps page (fallback) ─────────────────────────────────
-
-MAPS_URL = "https://www.google.com/maps/place/?q=place_id:{place_id}&hl=en&gl=us"
-
-
-def _maps_busyness() -> Optional[int]:
-    """Load the Maps place page with Playwright and try to extract busyness."""
-    try:
-        from playwright.sync_api import sync_playwright
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-blink-features=AutomationControlled",
-                    "--single-process",
-                ],
-            )
-            ctx = browser.new_context(
-                viewport={"width": 1280, "height": 900},
-                locale="en-US",
-                timezone_id="Pacific/Honolulu",
-                user_agent=(
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                ),
-            )
-            ctx.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                window.chrome = { runtime: {} };
-            """)
-
-            page = ctx.new_page()
-            url = MAPS_URL.format(place_id=config.PLACE_ID)
-            logger.info(f"Maps approach: loading {url}")
-            page.goto(url, wait_until="networkidle", timeout=45_000)
-
-            # Handle consent
-            try:
-                accept_btn = page.locator('button:has-text("Accept all")')
-                if accept_btn.count() > 0:
-                    accept_btn.first.click()
-                    page.wait_for_timeout(2_000)
-            except Exception:
-                pass
-
-            page.wait_for_timeout(4_000)
-
-            # Try JS extraction
-            val = page.evaluate("""() => {
-                const html = document.documentElement.innerHTML;
-                // current_popularity
-                let m = html.match(/"current_popularity"\\s*:\\s*(\\d+)/);
-                if (m) return parseInt(m[1]);
-                // % busy
-                m = html.match(/(\\d+)%\\s*busy/i);
-                if (m) return parseInt(m[1]);
-                // aria-label
-                const els = document.querySelectorAll('[aria-label*="busy"]');
-                for (const el of els) {
-                    m = el.getAttribute('aria-label').match(/(\\d+)%/);
-                    if (m) return parseInt(m[1]);
-                }
-                return null;
-            }""")
-
-            html = page.content()
-            title = page.title()
-            logger.info(f"Maps page title: {title}")
-            logger.info(f"Maps HTML length: {len(html)} chars")
-            logger.info(f"Maps HTML snippet: {html[:1500]}")
-
-            browser.close()
-
-            if val is not None:
-                return val
-
-            # Regex fallback on raw HTML
-            for pattern in [
-                r'"current_popularity"\s*:\s*(\d+)',
-                r'(\d+)%\s*busy',
-            ]:
-                m = re.search(pattern, html, re.IGNORECASE)
-                if m:
-                    return int(m.group(1))
-
-            return None
-
-    except Exception as e:
-        logger.error(f"Maps approach failed: {e}")
-        return None
-
-
-# ── Public API ──────────────────────────────────────────────────────────────
 
 def get_live_busyness() -> Optional[int]:
-    """Try all approaches to get live busyness."""
+    """
+    Return current busyness % (0-100) from BestTime live endpoint.
+    Falls back to the forecasted busyness for the current hour if
+    live data is unavailable.
+    """
+    api_key = _get_api_key()
+    if not api_key:
+        logger.error("BESTTIME_API_KEY not set!")
+        return None
 
-    # Try Google Search first (less blocked)
-    val = _search_busyness()
-    if val is not None:
-        logger.info(f"Live busyness (Search): {val}%")
-        return val
+    venue_id = _get_venue_id()
+    if not venue_id:
+        return None
 
-    # Fall back to Maps
-    val = _maps_busyness()
-    if val is not None:
-        logger.info(f"Live busyness (Maps): {val}%")
-        return val
+    # Try the live endpoint first
+    try:
+        resp = requests.post(
+            f"{BASE_URL}/forecasts/live",
+            params={
+                "api_key_private": api_key,
+                "venue_id": venue_id,
+            },
+            timeout=20,
+        )
+        data = resp.json()
 
-    logger.info("No busyness data from any source.")
+        if data.get("status") == "OK":
+            analysis = data.get("analysis", {})
+
+            # Live busyness (real-time)
+            live_val = analysis.get("venue_live_busyness")
+            if live_val is not None and analysis.get("venue_live_busyness_available"):
+                logger.info(f"Live busyness (real-time): {live_val}%")
+                return int(live_val)
+
+            # Forecasted busyness for current hour (fallback)
+            forecast_val = analysis.get("venue_forecasted_busyness")
+            if forecast_val is not None:
+                logger.info(f"Forecasted busyness (current hour): {forecast_val}%")
+                return int(forecast_val)
+
+        logger.warning(f"BestTime live response: {data.get('message', data.get('status', 'unknown'))}")
+    except Exception as e:
+        logger.error(f"BestTime live request failed: {e}")
+
+    # Fallback: query the forecast for the current hour
+    return _forecast_current_hour(api_key, venue_id)
+
+
+def _forecast_current_hour(api_key: str, venue_id: str) -> Optional[int]:
+    """Query the forecast for the current hour as a fallback."""
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/forecasts/now",
+            params={
+                "api_key_public": api_key.replace("pri_", "pub_"),
+                "venue_id": venue_id,
+            },
+            timeout=20,
+        )
+        data = resp.json()
+
+        if data.get("status") == "OK":
+            analysis = data.get("analysis", {})
+            raw = analysis.get("now_raw")
+            if raw is not None:
+                logger.info(f"Forecast now busyness: {raw}%")
+                return int(raw)
+    except Exception as e:
+        logger.error(f"BestTime now query failed: {e}")
     return None
 
 
 def get_todays_popular_times() -> list:
-    """Return hourly popular times for today (from the Maps page)."""
+    """
+    Return hourly popular times for today from BestTime forecast.
+    Each item: {"hour": int, "busyness": int, "label": str}
+    """
+    api_key = _get_api_key()
+    venue_id = _get_venue_id()
+    if not api_key or not venue_id:
+        return []
+
     try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--single-process"],
-            )
-            ctx = browser.new_context(
-                viewport={"width": 1280, "height": 900},
-                locale="en-US",
-                user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            )
-            page = ctx.new_page()
-            url = MAPS_URL.format(place_id=config.PLACE_ID)
-            page.goto(url, wait_until="networkidle", timeout=45_000)
-            page.wait_for_timeout(4_000)
-            html = page.content()
-            browser.close()
+        # Map Python weekday (Mon=0) to BestTime day_int (Mon=0)
+        today_int = datetime.now().weekday()
+
+        resp = requests.get(
+            f"{BASE_URL}/forecasts/day/raw",
+            params={
+                "api_key_public": api_key.replace("pri_", "pub_"),
+                "venue_id": venue_id,
+                "day_int": today_int,
+            },
+            timeout=20,
+        )
+        data = resp.json()
+
+        if data.get("status") == "OK":
+            analysis = data.get("analysis", {})
+            day_raw = analysis.get("day_raw", [])
+
+            if day_raw and len(day_raw) == 24:
+                return [
+                    {"hour": h, "busyness": v, "label": _fmt_hour(h)}
+                    for h, v in enumerate(day_raw) if v > 0
+                ]
     except Exception as e:
-        logger.error(f"Popular times fetch failed: {e}")
-        return []
+        logger.error(f"BestTime day query failed: {e}")
 
-    arrays = re.findall(r'\[(\d{1,3}(?:,\d{1,3}){23})\]', html)
-    plausible = []
-    for arr in arrays:
-        vals = list(map(int, arr.split(",")))
-        if all(0 <= v <= 100 for v in vals) and max(vals) > 10:
-            plausible.append(vals)
-
-    if not plausible:
-        return []
-
-    today_idx = datetime.now().weekday()
-    pt_idx = (today_idx + 1) % 7
-    day_data = plausible[pt_idx] if len(plausible) > pt_idx else plausible[0]
-
-    return [
-        {"hour": h, "busyness": v, "label": _fmt_hour(h)}
-        for h, v in enumerate(day_data) if v > 0
-    ]
+    return []
 
 
 def _fmt_hour(h: int) -> str:

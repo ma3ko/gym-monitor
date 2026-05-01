@@ -122,7 +122,7 @@ def main():
     # ── Full monitoring loop ──
     logger.info("=" * 60)
     logger.info("  24hr Gym Monitor starting up")
-    logger.info(f"  Place ID     : {config.PLACE_ID}")
+    logger.info(f"  BestTime API : {'Set' if config.BESTTIME_API_KEY else 'Missing'}")
     logger.info(f"  Check every  : {config.CHECK_INTERVAL_MINUTES} minutes")
     logger.info(f"  Quiet below  : {config.QUIET_THRESHOLD}%")
     logger.info(f"  Busy above   : {config.BUSY_THRESHOLD}%")
