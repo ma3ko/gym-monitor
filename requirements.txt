@@ -1,4 +1,3 @@
-git+https://github.com/m-wrzr/populartimes
 requests>=2.31.0
 python-dotenv>=1.0.0
 schedule>=1.2.1
