@@ -123,7 +123,7 @@ def main():
     logger.info("=" * 60)
     logger.info("  24hr Gym Monitor starting up")
     logger.info(f"  BestTime API : {'Set' if config.BESTTIME_API_KEY else 'Missing'}")
-    logger.info(f"  Check every  : {config.CHECK_INTERVAL_MINUTES} minutes")
+    logger.info("  Check every  : 30 minutes (at :00 and :30)")
     logger.info(f"  Quiet below  : {config.QUIET_THRESHOLD}%")
     logger.info(f"  Busy above   : {config.BUSY_THRESHOLD}%")
     logger.info(f"  Daily digest : {config.DAILY_DIGEST_TIME}")
@@ -135,13 +135,14 @@ def main():
     # Run a check immediately on startup
     check_gym()
 
-    # Schedule recurring checks
-    schedule.every(config.CHECK_INTERVAL_MINUTES).minutes.do(check_gym)
+    # Schedule recurring checks at top of the hour and half-past
+    schedule.every().hour.at(":00").do(check_gym)
+    schedule.every().hour.at(":30").do(check_gym)
 
     # Schedule daily digest
     schedule.every().day.at(config.DAILY_DIGEST_TIME).do(send_daily_digest)
 
-    logger.info(f"Monitoring started. Checking every {config.CHECK_INTERVAL_MINUTES} min.")
+    logger.info("Monitoring started. Checking at :00 and :30 of every hour.")
 
     while True:
         schedule.run_pending()
