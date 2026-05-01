@@ -1,12 +1,14 @@
 """
-scraper.py — Fetches live busyness from Google Maps.
-Uses Playwright with anti-bot settings and JS evaluation to read
-Google's internal APP_INITIALIZATION_STATE data directly.
+scraper.py — Fetches live busyness for a Google Maps place.
+
+Approach:
+  1. Try Google Search (less bot-protected than Maps)
+  2. Fall back to Google Maps with Playwright stealth
+  3. Multiple extraction patterns for maximum reliability
 """
 
 import os
 import re
-import json
 import logging
 from typing import Optional
 from datetime import datetime
@@ -17,16 +19,23 @@ import config
 
 logger = logging.getLogger(__name__)
 
-MAPS_URL = "https://www.google.com/maps/place/?q=place_id:{place_id}&hl=en&gl=us"
+# ── Approach 1: Google Search (preferred — less bot-protected) ──────────────
+
+SEARCH_URL = "https://www.google.com/search?q={query}&hl=en&gl=us"
 
 
-def _get_page_data(place_id: str) -> Optional[str]:
+def _search_busyness() -> Optional[int]:
     """
-    Launch stealth Chromium, load the Maps page, and return the full
-    page HTML + any JS state data we can extract.
+    Scrape the Google Search Knowledge Panel for live busyness.
+    Google Search is far less aggressive about blocking bots than Maps.
     """
     try:
         from playwright.sync_api import sync_playwright
+
+        # Build a search query that will trigger the Knowledge Panel
+        query = "24+Hour+Fitness+Kapiolani+Honolulu+popular+times"
+        url = SEARCH_URL.format(query=query)
+
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
@@ -35,12 +44,11 @@ def _get_page_data(place_id: str) -> Optional[str]:
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
                     "--disable-blink-features=AutomationControlled",
-                    "--disable-features=IsolateOrigins,site-per-process",
                     "--single-process",
                 ],
             )
             ctx = browser.new_context(
-                viewport={"width": 1280, "height": 800},
+                viewport={"width": 1280, "height": 900},
                 locale="en-US",
                 timezone_id="Pacific/Honolulu",
                 user_agent=(
@@ -48,131 +56,226 @@ def _get_page_data(place_id: str) -> Optional[str]:
                     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
                 ),
             )
-
-            # Mask automation signals
             ctx.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
                 window.chrome = { runtime: {} };
             """)
 
             page = ctx.new_page()
-            url = MAPS_URL.format(place_id=place_id)
-            logger.info(f"Loading: {url}")
+            logger.info(f"Search approach: loading {url}")
+            page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            page.wait_for_timeout(3_000)
+
+            # Try to click "Accept all" on Google consent
+            try:
+                accept_btn = page.locator('button:has-text("Accept all")')
+                if accept_btn.count() > 0:
+                    accept_btn.first.click()
+                    page.wait_for_timeout(2_000)
+                    logger.info("Clicked Google consent 'Accept all' button")
+            except Exception:
+                pass
+
+            # Extract busyness from the Knowledge Panel
+            # Method 1: aria-label with "% busy"
+            val = page.evaluate("""() => {
+                const els = document.querySelectorAll('[aria-label]');
+                for (const el of els) {
+                    const label = el.getAttribute('aria-label') || '';
+                    const m = label.match(/(\\d+)\\s*%\\s*busy/i);
+                    if (m) return parseInt(m[1]);
+                }
+                return null;
+            }""")
+
+            if val is not None:
+                browser.close()
+                return val
+
+            # Method 2: Text content with "% busy"
+            val = page.evaluate("""() => {
+                const text = document.body.innerText;
+                const m = text.match(/(\\d+)%\\s*busy/i);
+                return m ? parseInt(m[1]) : null;
+            }""")
+
+            if val is not None:
+                browser.close()
+                return val
+
+            # Method 3: Regex on raw HTML
+            html = page.content()
+            title = page.title()
+            logger.info(f"Search page title: {title}")
+            logger.info(f"Search HTML length: {len(html)} chars")
+            # Log a useful snippet for debugging
+            logger.info(f"Search HTML snippet: {html[:1500]}")
+
+            browser.close()
+
+            for pattern in [
+                r'"current_popularity"\s*:\s*(\d+)',
+                r'(\d+)%\s*busy',
+                r'aria-label="[^"]*?(\d+)%[^"]*busy',
+            ]:
+                m = re.search(pattern, html, re.IGNORECASE)
+                if m:
+                    return int(m.group(1))
+
+            return None
+
+    except Exception as e:
+        logger.error(f"Search approach failed: {e}")
+        return None
+
+
+# ── Approach 2: Google Maps page (fallback) ─────────────────────────────────
+
+MAPS_URL = "https://www.google.com/maps/place/?q=place_id:{place_id}&hl=en&gl=us"
+
+
+def _maps_busyness() -> Optional[int]:
+    """Load the Maps place page with Playwright and try to extract busyness."""
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-blink-features=AutomationControlled",
+                    "--single-process",
+                ],
+            )
+            ctx = browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                locale="en-US",
+                timezone_id="Pacific/Honolulu",
+                user_agent=(
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                ),
+            )
+            ctx.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                window.chrome = { runtime: {} };
+            """)
+
+            page = ctx.new_page()
+            url = MAPS_URL.format(place_id=config.PLACE_ID)
+            logger.info(f"Maps approach: loading {url}")
             page.goto(url, wait_until="networkidle", timeout=45_000)
 
-            # Wait extra for popular-times widget
+            # Handle consent
+            try:
+                accept_btn = page.locator('button:has-text("Accept all")')
+                if accept_btn.count() > 0:
+                    accept_btn.first.click()
+                    page.wait_for_timeout(2_000)
+            except Exception:
+                pass
+
             page.wait_for_timeout(4_000)
 
-            # Strategy 1: Read APP_INITIALIZATION_STATE from JS context
-            js_state = page.evaluate("""() => {
-                try {
-                    const s = window.APP_INITIALIZATION_STATE;
-                    return s ? JSON.stringify(s) : null;
-                } catch(e) { return null; }
-            }""")
-
-            # Strategy 2: Look for current_popularity in any window variable
-            current_pop = page.evaluate("""() => {
-                try {
-                    const html = document.documentElement.innerHTML;
-                    const m = html.match(/"current_popularity"\\s*:\\s*(\\d+)/);
-                    return m ? parseInt(m[1]) : null;
-                } catch(e) { return null; }
-            }""")
-
-            # Strategy 3: Check aria-labels on busyness bars
-            aria_pop = page.evaluate("""() => {
-                try {
-                    const els = document.querySelectorAll('[aria-label*="busy"]');
-                    for (const el of els) {
-                        const m = el.getAttribute('aria-label').match(/(\\d+)%/);
-                        if (m) return parseInt(m[1]);
-                    }
-                    return null;
-                } catch(e) { return null; }
+            # Try JS extraction
+            val = page.evaluate("""() => {
+                const html = document.documentElement.innerHTML;
+                // current_popularity
+                let m = html.match(/"current_popularity"\\s*:\\s*(\\d+)/);
+                if (m) return parseInt(m[1]);
+                // % busy
+                m = html.match(/(\\d+)%\\s*busy/i);
+                if (m) return parseInt(m[1]);
+                // aria-label
+                const els = document.querySelectorAll('[aria-label*="busy"]');
+                for (const el of els) {
+                    m = el.getAttribute('aria-label').match(/(\\d+)%/);
+                    if (m) return parseInt(m[1]);
+                }
+                return null;
             }""")
 
             html = page.content()
+            title = page.title()
+            logger.info(f"Maps page title: {title}")
+            logger.info(f"Maps HTML length: {len(html)} chars")
+            logger.info(f"Maps HTML snippet: {html[:1500]}")
+
             browser.close()
 
-            # Log a snippet for debugging
-            snip = html[:500].replace("\n", " ")
-            logger.debug(f"Page snippet: {snip}")
+            if val is not None:
+                return val
 
-            return {
-                "html": html,
-                "js_state": js_state,
-                "current_pop": current_pop,
-                "aria_pop": aria_pop,
-            }
+            # Regex fallback on raw HTML
+            for pattern in [
+                r'"current_popularity"\s*:\s*(\d+)',
+                r'(\d+)%\s*busy',
+            ]:
+                m = re.search(pattern, html, re.IGNORECASE)
+                if m:
+                    return int(m.group(1))
+
+            return None
 
     except Exception as e:
-        logger.error(f"Playwright fetch failed: {e}")
+        logger.error(f"Maps approach failed: {e}")
         return None
 
+
+# ── Public API ──────────────────────────────────────────────────────────────
 
 def get_live_busyness() -> Optional[int]:
-    """Return current busyness % (0-100) or None if unavailable."""
-    data = _get_page_data(config.PLACE_ID)
-    if not data:
-        return None
+    """Try all approaches to get live busyness."""
 
-    # Priority 1: Direct JS extraction of current_popularity
-    if data["current_pop"] is not None:
-        logger.info(f"Live busyness (JS innerHTML): {data['current_pop']}%")
-        return data["current_pop"]
+    # Try Google Search first (less blocked)
+    val = _search_busyness()
+    if val is not None:
+        logger.info(f"Live busyness (Search): {val}%")
+        return val
 
-    # Priority 2: aria-label on busyness bar elements
-    if data["aria_pop"] is not None:
-        logger.info(f"Live busyness (aria-label): {data['aria_pop']}%")
-        return data["aria_pop"]
+    # Fall back to Maps
+    val = _maps_busyness()
+    if val is not None:
+        logger.info(f"Live busyness (Maps): {val}%")
+        return val
 
-    # Priority 3: Parse APP_INITIALIZATION_STATE JSON blob
-    if data["js_state"]:
-        m = re.search(r'"current_popularity"\s*:\s*(\d+)', data["js_state"])
-        if m:
-            val = int(m.group(1))
-            logger.info(f"Live busyness (APP_STATE): {val}%")
-            return val
-
-    # Priority 4: Regex fallbacks on raw HTML
-    html = data["html"]
-    for pattern in [
-        r'"current_popularity"\s*:\s*(\d+)',
-        r'(\d+)%\s*busy',
-        r'aria-label="(\d+)%',
-    ]:
-        m = re.search(pattern, html, re.IGNORECASE)
-        if m:
-            val = int(m.group(1))
-            logger.info(f"Live busyness (HTML regex): {val}%")
-            return val
-
-    logger.info("No busyness data found — gym may be closed or Google blocked the request.")
+    logger.info("No busyness data from any source.")
     return None
 
 
 def get_todays_popular_times() -> list:
-    """Return hourly historical popular times for today."""
-    data = _get_page_data(config.PLACE_ID)
-    if not data:
+    """Return hourly popular times for today (from the Maps page)."""
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--single-process"],
+            )
+            ctx = browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                locale="en-US",
+                user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            )
+            page = ctx.new_page()
+            url = MAPS_URL.format(place_id=config.PLACE_ID)
+            page.goto(url, wait_until="networkidle", timeout=45_000)
+            page.wait_for_timeout(4_000)
+            html = page.content()
+            browser.close()
+    except Exception as e:
+        logger.error(f"Popular times fetch failed: {e}")
         return []
 
-    html = data["html"]
     arrays = re.findall(r'\[(\d{1,3}(?:,\d{1,3}){23})\]', html)
     plausible = []
     for arr in arrays:
         vals = list(map(int, arr.split(",")))
         if all(0 <= v <= 100 for v in vals) and max(vals) > 10:
             plausible.append(vals)
-
-    if not plausible and data["js_state"]:
-        arrays = re.findall(r'\[(\d{1,3}(?:,\d{1,3}){23})\]', data["js_state"])
-        for arr in arrays:
-            vals = list(map(int, arr.split(",")))
-            if all(0 <= v <= 100 for v in vals) and max(vals) > 10:
-                plausible.append(vals)
 
     if not plausible:
         return []
