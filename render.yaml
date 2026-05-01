@@ -2,7 +2,7 @@ services:
   - type: worker
     name: gym-monitor
     env: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt && playwright install chromium && playwright install-deps chromium
     startCommand: python monitor.py
     envVars:
       - key: BOT_TOKEN
