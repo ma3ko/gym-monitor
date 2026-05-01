@@ -1,0 +1,21 @@
+services:
+  - type: worker
+    name: gym-monitor
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python monitor.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: CHAT_ID
+        sync: false
+      - key: PLACE_ID
+        value: ChIJc13fXp0RHwgR6jS7-Wp48H0
+      - key: QUIET_THRESHOLD
+        value: "35"
+      - key: BUSY_THRESHOLD
+        value: "65"
+      - key: CHECK_INTERVAL_MINUTES
+        value: "15"
+      - key: DAILY_DIGEST_TIME
+        value: "08:00"

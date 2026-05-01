@@ -1,0 +1,10 @@
+# Secrets — never commit these
+.env
+
+# Runtime files
+state.json
+monitor.log
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
